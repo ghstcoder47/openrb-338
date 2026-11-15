@@ -219,6 +219,29 @@ the cargo registry and the target dir are in the named volumes `openrb-rustup-<a
 `openrb-cargo-<arch>` and `openrb-target-<arch>`, so a second run is incremental.
 `docker volume rm` them to start clean.
 
+### ASIO (Windows x86_64)
+
+On Windows `orb-player` builds cpal's `asio` feature (a default feature of `orb-cli` and
+`orb-ui`), so the installed ASIO drivers (ASIO4ALL, RME, Focusrite, ...) are listed beside WASAPI
+(`orb devices`, Options > Audio Output Device). The feature is inert off Windows. `asio-sys`
+needs, at build time:
+
+- the Steinberg ASIO SDK (GPLv3, like this workspace): it downloads it itself with PowerShell's
+  `Expand-Archive`; if that fails, unpack the SDK and point `CPAL_ASIO_DIR` at the folder that
+  holds `common/`, `host/` and `driver/`;
+- libclang for bindgen: install LLVM (`winget install LLVM.LLVM`) and set `LIBCLANG_PATH` to its
+  `bin` folder when it is not found.
+
+`scripts/build.sh` passes `--no-default-features` (no ASIO) for the Windows cross builds
+(`cargo xwin`) and for Windows arm64, which have neither the SDK nor libclang; a native x86_64
+Windows build has ASIO. For a plain `cargo build` elsewhere, `--no-default-features` does the
+same.
+
+If the UI's audio stream fails, it retries the effective device up to three times, waiting
+500 ms before each attempt. A failed reopen also counts as an attempt; only the final failure
+opens an error box. Choosing another device cancels the pending retry. If the audio backend
+cannot return the player state, recovery needs an app restart instead.
+
 ## Environment variables
 
 Every variable of the project has the prefix `ORB_` (task-068; the CLI is `orb`). The old `RB_`
@@ -232,6 +255,7 @@ and `OPENRB_` names are not read any more and have no deprecated alias.
 | `ORB_MOD_DIR` | `orb render`, `compare`, `play`, `info`; OpenRB-338 | the folder of recrypted `.rbm` mods (`--mod-dir` wins) | `RB_MOD_DIR` |
 | `ORB_RB20FUL` | `orb mod recrypt` | the path of `RB20FUL.DAT` (`--rb20ful` wins); also the default of `tools/rbcorpus.py` | `RB_RB20FUL` |
 | `ORB_UI_CONFIG` | OpenRB-338 | the settings file to use instead of `OpenRB-338/ui.toml` in the configuration folder | `RB_UI_CONFIG` |
+| `ORB_AUDIO_DEVICE` | `orb play`, OpenRB-338 | the audio output device: an id or a part of the name from `orb devices` (`--device` wins; OpenRB-338's Options > Audio Output Device is the setting `audio_device`, which this overrides); default: the system's default device | none |
 | `ORB_UI_LOG_DIR` | OpenRB-338 (`crates/orb-ui/src/crash.rs`, task-157) | the folder of the crash logs instead of the platform's (below); tests set it | none |
 | `ORB_UI_NO_CRASH_DIALOG` | OpenRB-338 | any non-empty value except `0` turns off the native box after a panic (the log and stderr stay); tests set `1` | none |
 | `ORB_LOGO_T` | OpenRB-338 | seconds: freezes the logo's startup animation at that time (pictures; task-114, `crates/orb-ui/src/logo_anim.rs`) | none |

@@ -95,6 +95,8 @@ pub enum Cmd {
     ToggleVintage,
     /// "Play Mod Startup Sound" of the Options menu (the original's Edit > Preferences).
     ToggleStartupSound,
+    /// The audio output device for the next start (`None`: the system's default).
+    SetAudioDevice(Option<String>),
     SetKeyMode(KeyMode),
 }
 
@@ -922,6 +924,15 @@ impl App {
                     self.fail(e);
                 }
             }
+            Cmd::SetAudioDevice(d) => {
+                self.settings.audio_device = d.clone();
+                if let Err(e) = self.settings.save() {
+                    self.fail(e);
+                }
+                self.audio_retries = 0;
+                self.audio_spec = d;
+                self.switch_audio(self.audio_spec.clone().as_deref());
+            }
             Cmd::SetKeyMode(m) => self.key_mode = m,
         }
     }
@@ -1222,6 +1233,35 @@ impl App {
                                 cmd = Some(Cmd::ToggleStartupSound);
                                 ui.close();
                             }
+                            ui.separator();
+                            ui.menu_button("Audio Output Device", |ui| {
+                                let stale = self
+                                    .audio_devices
+                                    .as_ref()
+                                    .is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 1.0);
+                                if stale {
+                                    let now = std::time::Instant::now();
+                                    self.audio_devices = Some((now, orb_player::output::devices()));
+                                }
+                                ui.ctx()
+                                    .request_repaint_after(std::time::Duration::from_secs(1));
+                                let devices = self.audio_devices.as_ref().map_or(&[][..], |d| &d.1);
+                                let chosen = self.settings.audio_device.as_deref();
+                                if ui.radio(chosen.is_none(), "System default").clicked() {
+                                    cmd = Some(Cmd::SetAudioDevice(None));
+                                    ui.close();
+                                }
+                                for d in devices {
+                                    let label = format!("{} ({})", d.name, d.host);
+                                    let on = chosen == Some(d.id.as_str());
+                                    if ui.radio(on, label).clicked() {
+                                        cmd = Some(Cmd::SetAudioDevice(Some(d.id.clone())));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                ui.weak("The song's sound moves to the chosen device at once.");
+                            });
                             ui.separator();
                             let ctx = ui.ctx().clone();
                             let synth = format!(

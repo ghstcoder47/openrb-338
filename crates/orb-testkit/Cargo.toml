@@ -7,6 +7,6 @@ publish.workspace = true
 description = "Test support: the external inputs of the gated tests (task-121)"
 
 [dependencies]
-orb-cli = { path = "../orb-cli" }
+orb-cli = { path = "../orb-cli", default-features = false }
 rbm = { path = "../rbm" }
 sha2 = "0.10"

@@ -41,6 +41,11 @@ esac
 # are in target/<target>/dist/.
 profile=dist
 cargo_args=(--profile "$profile" --locked --target "$target" -p orb-cli -p orb-ui)
+# ASIO (the `asio` feature) needs the Steinberg SDK and libclang: only a native x86_64 Windows
+# build has them, so the cross builds and Windows arm64 go without (docs/building.md)
+if [ "$os" = windows ] && { [ "$host_os" != windows ] || [ "$arch" != x86_64 ]; }; then
+    cargo_args+=(--no-default-features)
+fi
 target_dir=${CARGO_TARGET_DIR:-$root/target}
 
 build_docker() {

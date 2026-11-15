@@ -233,8 +233,10 @@ fn main() -> eframe::Result {
     // errors of the start, shown in the message box once the app is up (task-130)
     let mut start_errors: Vec<String> = Vec::new();
     // keeps the audio stream alive for the whole run
-    let mut _stream = None;
+    let mut stream = None;
+    let mut spare_audio = None;
     let mut audio_health = None;
+    let mut audio_spec = None;
     if !demo {
         let samples = Some(rbm::standard::builtin_samples());
         app_samples = samples.clone();
@@ -250,7 +252,12 @@ fn main() -> eframe::Result {
                 }
             }
         }
-        match orb_player::output::start(audio) {
+        let device = std::env::var("ORB_AUDIO_DEVICE")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .or_else(|| Settings::load().audio_device);
+        audio_spec = device.clone();
+        match orb_player::output::start_keep(audio, device.as_deref()) {
             Ok(s) => {
                 eprintln!(
                     "OpenRB-338: audio on {} ({} Hz{}, {} channels, {}, {})",
@@ -266,9 +273,10 @@ fn main() -> eframe::Result {
                     s.buffer_text()
                 );
                 audio_health = Some(s.health());
-                _stream = Some(s);
+                stream = Some(s);
             }
-            Err(e) => {
+            Err((e, audio)) => {
+                spare_audio = audio;
                 eprintln!("OpenRB-338: audio output: {e}; the panel runs without sound");
                 // the one failure at the launch is an error the user expects to hear of: the
                 // box. Later audio errors repeat: `App::notify`.
@@ -329,6 +337,9 @@ fn main() -> eframe::Result {
             };
             app.samples = app_samples;
             app.audio_health = audio_health;
+            app.audio_stream = stream;
+            app.audio_spare = spare_audio;
+            app.audio_spec = audio_spec;
             app.menu = true;
             app.enable_logo_anim();
             app.settings = Settings::load();

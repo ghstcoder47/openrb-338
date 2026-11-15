@@ -50,7 +50,8 @@ fn err(what: &str, e: impl std::fmt::Display) -> Error {
 
 /// A running output stream; dropping it stops the sound.
 pub struct Stream {
-    _stream: cpal::Stream,
+    stream: cpal::Stream,
+    slot: rtrb::Consumer<Audio>,
     /// The device's name.
     pub device: String,
     /// The stream's configuration.
@@ -90,6 +91,16 @@ impl Stream {
             Some(n) => format!("buffer {req}, first callback {n} frames"),
             None => format!("buffer {req}, no callback yet"),
         }
+    }
+
+    /// Stops the stream and returns the audio it played, to start on another device. `None` if
+    /// the host did not release the callback.
+    pub fn stop(self) -> Option<Audio> {
+        let Stream {
+            stream, mut slot, ..
+        } = self;
+        drop(stream);
+        slot.pop().ok()
     }
 
     /// Whether the sound has really stopped ([`Health::failure`]).
@@ -597,8 +608,9 @@ fn choose(
 }
 
 /// Holds the [`Output`] inside the stream's callback and hands its [`Audio`] back when the
-/// callback is dropped, so that a refused build can be retried. The hand-back is a one-place
-/// wait-free queue, pushed to only in `drop`, never by the data callback.
+/// callback is dropped, so that a refused build can be retried or a stopped stream can switch
+/// devices. The hand-back is a one-place wait-free queue, pushed to only in `drop`, never by the
+/// data callback.
 struct Keeper {
     out: Option<Output>,
     back: rtrb::Producer<Audio>,
@@ -656,17 +668,125 @@ fn build<T: SizedSample + FromSample<f32>>(
         .map_err(|e| err("the output stream", e))
 }
 
+/// An output device a stream can play on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// The device's id, `host:device` (`wasapi:{0.0.0...}`, `coreaudio:...`, `alsa:default`):
+    /// stable, so a setting keeps it. [`start_on`] takes it.
+    pub id: String,
+    /// The name to show.
+    pub name: String,
+    /// The audio system the device belongs to (`wasapi`, `coreaudio`, `alsa`, ...).
+    pub host: String,
+    /// Whether it is the default output device of its host.
+    pub is_default: bool,
+}
+
+/// All output devices of every audio system of this platform, the default host's first.
+pub fn devices() -> Vec<DeviceInfo> {
+    let default = cpal::default_host().id();
+    let mut hosts = cpal::available_hosts();
+    hosts.sort_by_key(|h| *h != default);
+    let mut out = Vec::new();
+    for id in hosts {
+        let Ok(host) = cpal::host_from_id(id) else {
+            continue;
+        };
+        let default_id = host.default_output_device().and_then(|d| d.id().ok());
+        let Ok(list) = host.output_devices() else {
+            continue;
+        };
+        for d in list {
+            let Ok(did) = d.id() else {
+                continue;
+            };
+            let name = d
+                .description()
+                .map(|x| x.to_string())
+                .unwrap_or_else(|_| did.to_string());
+            out.push(DeviceInfo {
+                id: did.to_string(),
+                name,
+                host: id.to_string(),
+                is_default: default_id.as_ref() == Some(&did),
+            });
+        }
+    }
+    out
+}
+
+/// The device `spec` names: its id (as [`DeviceInfo::id`]) or, failing that, a part of its name
+/// (case-insensitive, and it must name one device only).
+fn find(spec: &str) -> Result<cpal::Device, Error> {
+    let hint = "`orb devices` lists them";
+    if let Ok(id) = spec.parse::<cpal::DeviceId>() {
+        let found = cpal::host_from_id(id.host())
+            .ok()
+            .and_then(|h| h.device_by_id(&id));
+        return found.ok_or_else(|| Error(format!("no output device {spec:?}; {hint}")));
+    }
+    let want = spec.to_lowercase();
+    let mut matches = Vec::new();
+    for id in cpal::available_hosts() {
+        let Ok(host) = cpal::host_from_id(id) else {
+            continue;
+        };
+        let Ok(list) = host.output_devices() else {
+            continue;
+        };
+        for d in list {
+            let name = d.description().map(|x| x.to_string()).unwrap_or_default();
+            if name.to_lowercase().contains(&want) {
+                matches.push((name, d));
+            }
+        }
+    }
+    match matches.len() {
+        0 => Err(Error(format!("no output device {spec:?}; {hint}"))),
+        1 => Ok(matches.remove(0).1),
+        _ => {
+            let names: Vec<_> = matches.iter().map(|m| m.0.as_str()).collect();
+            Err(Error(format!(
+                "{spec:?} names several output devices ({}); give the id from `orb devices`",
+                names.join(", ")
+            )))
+        }
+    }
+}
+
 /// Plays `audio` through the default output device.
 pub fn start(audio: Audio) -> Result<Stream, Error> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| Error("no default output device".into()))?;
+    start_on(audio, None)
+}
+
+/// Plays `audio` through the output device `device` names (an id or a part of the name, see
+/// [`devices`]), or through the default one.
+pub fn start_on(audio: Audio, device: Option<&str>) -> Result<Stream, Error> {
+    start_keep(audio, device).map_err(|(e, _)| e)
+}
+
+/// [`start_on`] that gives the audio back with the error when it can (so the caller can start
+/// it on another device), `None` if it was lost.
+#[allow(clippy::result_large_err)]
+pub fn start_keep(audio: Audio, device: Option<&str>) -> Result<Stream, (Error, Option<Audio>)> {
+    let found = match device {
+        Some(spec) => find(spec),
+        None => cpal::default_host()
+            .default_output_device()
+            .ok_or_else(|| Error("no default output device".into())),
+    };
+    let device = match found {
+        Ok(d) => d,
+        Err(e) => return Err((e, Some(audio))),
+    };
     let name = device
         .description()
         .map(|d| d.to_string())
         .unwrap_or_else(|_| "?".into());
-    let (config, format, range) = choose(&device)?;
+    let (config, format, range) = match choose(&device) {
+        Ok(c) => c,
+        Err(e) => return Err((e, Some(audio))),
+    };
     let requested = buffer_request(&range);
     let resampled = config.sample_rate != RATE;
     let health = Health::started();
@@ -683,7 +803,8 @@ pub fn start(audio: Audio) -> Result<Stream, Error> {
             break;
         };
         let (back, mut recover) = rtrb::RingBuffer::new(1);
-        let out = Output::new(a, config.channels as usize, config.sample_rate)?;
+        let out =
+            Output::new(a, config.channels as usize, config.sample_rate).map_err(|e| (e, None))?;
         let config = StreamConfig {
             buffer_size,
             ..config
@@ -702,14 +823,18 @@ pub fn start(audio: Audio) -> Result<Stream, Error> {
         };
         match built {
             Ok(stream) => {
-                stream.play().map_err(|e| err("starting the stream", e))?;
+                if let Err(e) = stream.play() {
+                    drop(stream);
+                    return Err((err("starting the stream", e), recover.pop().ok()));
+                }
                 // the first callback tells the granted size; it comes within a few periods
                 let t = Instant::now();
                 while stats.snapshot().calls == 0 && t.elapsed().as_millis() < 300 {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 return Ok(Stream {
-                    _stream: stream,
+                    stream,
+                    slot: recover,
                     device: name,
                     config,
                     format,
@@ -726,7 +851,7 @@ pub fn start(audio: Audio) -> Result<Stream, Error> {
             }
         }
     }
-    Err(last)
+    Err((last, audio))
 }
 
 #[cfg(test)]
@@ -734,6 +859,30 @@ mod tests {
     use super::*;
 
     const ERR: &str = "snd_pcm_avail_delay: I/O error";
+
+    #[test]
+    fn a_dropped_callback_returns_a_player_that_still_receives_commands() {
+        let (mut player, audio) =
+            crate::Player::new(Arc::new(orb_engine::tables::Tables::new()), None);
+        let (back, mut recover) = rtrb::RingBuffer::new(1);
+        let mut keeper = Keeper {
+            out: Some(Output::new(audio, 2, RATE).unwrap()),
+            back,
+        };
+        assert!(player.send(crate::Command::Play).is_ok());
+        let mut data = [0.0f32; 2 * CALL_FRAMES];
+        keeper.out.as_mut().unwrap().fill(&mut data);
+        assert!(player.snapshot().playing);
+
+        drop(keeper);
+        let mut audio = recover
+            .pop()
+            .expect("the stopped callback returned its player");
+        assert!(recover.pop().is_err());
+        assert!(player.send(crate::Command::Stop).is_ok());
+        audio.render_f32(&mut data);
+        assert!(!player.snapshot().playing);
+    }
 
     #[test]
     fn buffer_choice() {

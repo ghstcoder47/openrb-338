@@ -49,6 +49,9 @@ pub struct Settings {
     /// to file name. Stored as the table `preferred_mods`. Names are compared ignoring ASCII
     /// case ([`Settings::preferred_mod`]).
     pub preferred_mods: BTreeMap<String, String>,
+    /// The audio output device (an id from `orb_player::output::devices`; `None`: the system's
+    /// default device). Stored as `audio_device`; it applies at the next start.
+    pub audio_device: Option<String>,
     /// Where this was read from and is written to (`None`: never persisted, as in tests).
     pub file: Option<PathBuf>,
 }
@@ -63,6 +66,7 @@ impl Default for Settings {
             last_song_dir: None,
             last_mod_dir: None,
             preferred_mods: BTreeMap::new(),
+            audio_device: None,
             file: None,
         }
     }
@@ -121,6 +125,8 @@ struct Stored<'a> {
     last_song_dir: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_mod_dir: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_device: Option<&'a str>,
     // a table, so last
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     preferred_mods: BTreeMap<&'a str, &'a str>,
@@ -166,6 +172,11 @@ impl Settings {
         s.mods_dir = table.get("mods_dir").and_then(path_of);
         s.last_song_dir = table.get("last_song_dir").and_then(path_of);
         s.last_mod_dir = table.get("last_mod_dir").and_then(path_of);
+        s.audio_device = table
+            .get("audio_device")
+            .and_then(|v| v.as_str())
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned);
         if let Some(list) = table.get("recent").and_then(|v| v.as_array()) {
             for p in list.iter().filter_map(path_of) {
                 if s.recent.len() < MAX_RECENT && !s.recent.contains(&p) {
@@ -213,6 +224,7 @@ impl Settings {
             recent: self.recent.iter().filter_map(|p| storable(p)).collect(),
             last_song_dir: self.last_song_dir.as_deref().and_then(storable),
             last_mod_dir: self.last_mod_dir.as_deref().and_then(storable),
+            audio_device: self.audio_device.as_deref(),
             preferred_mods: self
                 .preferred_mods
                 .iter()

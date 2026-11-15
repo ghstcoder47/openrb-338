@@ -94,7 +94,15 @@ enum Cmd {
         /// When the song's mod is not found, play with the built-in kit, as in render.
         #[arg(long)]
         standard_kit: bool,
+        /// The audio output device: an id or a part of the name from `orb devices` (default:
+        /// the ORB_AUDIO_DEVICE environment variable, else the system's default device).
+        #[arg(long, value_name = "DEVICE")]
+        device: Option<String>,
     },
+    /// List the audio output devices `orb play --device` can use (and OpenRB-338's Options menu),
+    /// across the audio systems of this computer (WASAPI, CoreAudio, ALSA, JACK, ...): one per
+    /// line, `ID<TAB>NAME`, the default of each system marked with `*`.
+    Devices,
     /// Print a song's metadata, as File > Info of the UI shows it: the format and version, the
     /// window title, the more text, the web page, the copyright, the mod and where it resolves
     /// (the built-in kit, a file of the mod folder, missing, or not checked), the tempo, the
@@ -295,16 +303,29 @@ fn main() -> ExitCode {
             mod_dir,
             mod_file,
             standard_kit,
+            device,
         } => play(
             &input,
             bar,
             seconds,
+            device,
             ModOpts {
                 mod_file,
                 mod_dir,
                 standard_kit,
             },
         ),
+        Cmd::Devices => {
+            for d in orb_player::output::devices() {
+                println!(
+                    "{}\t{}{}",
+                    d.id,
+                    d.name,
+                    if d.is_default { " *" } else { "" }
+                );
+            }
+            Ok(())
+        }
         Cmd::Info {
             input,
             mod_dir,
@@ -568,8 +589,15 @@ fn render(
     Renderer::new(mods).render_to_file(&label, &song, idle_blocks, format, quality, output)
 }
 
-/// `orb play`: the song in the real-time player (`orb-player`) on the default output device.
-fn play(input: &Path, bar: Option<u32>, seconds: Option<f64>, mods: ModOpts) -> Result<(), Fail> {
+/// `orb play`: the song in the real-time player (`orb-player`) on the chosen output device
+/// (`--device`, else `ORB_AUDIO_DEVICE`, else the default one).
+fn play(
+    input: &Path,
+    bar: Option<u32>,
+    seconds: Option<f64>,
+    device: Option<String>,
+    mods: ModOpts,
+) -> Result<(), Fail> {
     use orb_player::{Command, Player};
     if let Some(s) = seconds
         && (s.is_nan() || s <= 0.0)
@@ -601,8 +629,13 @@ fn play(input: &Path, bar: Option<u32>, seconds: Option<f64>, mods: ModOpts) -> 
             .map_err(queue)?;
     }
     player.send(Command::Play).map_err(queue)?;
-    let stream =
-        orb_player::output::start(audio).map_err(|e| fail(1, format!("audio output: {e}")))?;
+    let device = device.or_else(|| {
+        std::env::var("ORB_AUDIO_DEVICE")
+            .ok()
+            .filter(|d| !d.is_empty())
+    });
+    let stream = orb_player::output::start_on(audio, device.as_deref())
+        .map_err(|e| fail(1, format!("audio output: {e}")))?;
     eprintln!(
         "orb: playing {label} on {} ({} Hz{}, {} channels, {}, {}); Ctrl+C stops",
         stream.device,

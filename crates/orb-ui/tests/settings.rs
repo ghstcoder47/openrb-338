@@ -41,6 +41,29 @@ fn the_settings_round_trip_through_toml() {
     assert_eq!(fs::read_dir(file.parent().unwrap()).unwrap().count(), 1);
 }
 
+/// The audio output device is the string `audio_device`; unset (or empty) means the default.
+#[test]
+fn the_audio_device_round_trips_through_toml() {
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("ui.toml");
+    let mut s = Settings::load_from(&file);
+    assert_eq!(s.audio_device, None);
+    s.audio_device = Some("wasapi:{0.0.0.00000000}.{abc}".into());
+    s.save().unwrap();
+    let t: toml::Table = fs::read_to_string(&file).unwrap().parse().unwrap();
+    assert_eq!(
+        t["audio_device"].as_str(),
+        Some("wasapi:{0.0.0.00000000}.{abc}")
+    );
+    assert_eq!(Settings::load_from(&file), s);
+    s.audio_device = None;
+    s.save().unwrap();
+    let t: toml::Table = fs::read_to_string(&file).unwrap().parse().unwrap();
+    assert!(!t.contains_key("audio_device"));
+    fs::write(&file, "audio_device = \"\"\n").unwrap();
+    assert_eq!(Settings::load_from(&file).audio_device, None);
+}
+
 /// task-151: the preferred file among mods that share an INFO name is the table
 /// `preferred_mods`; the name is compared ignoring ASCII case.
 #[test]

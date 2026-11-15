@@ -13,6 +13,11 @@ path = "src/lib.rs"
 name = "orb"
 path = "src/main.rs"
 
+[features]
+# ASIO drivers in the device list (Windows); off for the cross builds (scripts/build.sh).
+default = ["asio"]
+asio = ["orb-player/asio"]
+
 [dependencies]
 rbs = { path = "../rbs" }
 orb-engine = { path = "../orb-engine" }

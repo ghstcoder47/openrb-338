@@ -16,6 +16,12 @@ triple_buffer = "9.0.0"
 # The resampler for a device that does not offer 44.1 kHz (sinc only: no FFT resampler).
 rubato = { version = "5.0.1", default-features = false }
 
+# ASIO drivers (ASIO4ALL, RME, ...) are listed beside WASAPI on Windows. The ASIO SDK is GPLv3
+# (the license of this workspace) and is fetched at build time by asio-sys, which also needs
+# libclang (docs/building.md). Off for the cross builds and Windows arm64 (scripts/build.sh).
+[features]
+asio = ["cpal/asio"]
+
 [dev-dependencies]
 rbs = { path = "../rbs" }
 # The recrypted mods of the mod-change sessions (tests/live_messages.rs).

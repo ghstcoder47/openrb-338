@@ -29,6 +29,8 @@ use crate::model::Panel;
 use crate::settings::Settings;
 use crate::shortcuts;
 
+const AUDIO_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// Where the panel is on screen: the point of the panel's origin and points per panel pixel.
 #[derive(Clone, Copy, Debug)]
 pub struct View {
@@ -137,6 +139,21 @@ pub struct App {
     /// stall is reported once (`App::check_audio`), as in `orb play` (task-139).
     pub audio_health: Option<orb_player::output::Health>,
     audio_reported: bool,
+    /// How often a failed stream was opened again by itself (`App::check_audio`).
+    pub(crate) audio_retries: u32,
+    /// The device the stream plays on (a spec of `orb_player::output::find`; `None`: the system
+    /// default): the setting, or `ORB_AUDIO_DEVICE` when it was set at the start. A retry keeps
+    /// it.
+    pub audio_spec: Option<String>,
+    audio_retry_at: Option<std::time::Instant>,
+    audio_pending_retry: Option<std::time::Instant>,
+    /// The running audio stream, kept to stop it on a device change (`App::switch_audio`).
+    pub audio_stream: Option<orb_player::output::Stream>,
+    /// The audio of no stream (the start failed or a switch did), for the next one.
+    pub audio_spare: Option<orb_player::Audio>,
+    /// The output devices the Options menu lists, and when they were read: the list is read
+    /// again while that submenu is open, so a device plugged in meanwhile shows up.
+    pub(crate) audio_devices: Option<(std::time::Instant, Vec<orb_player::output::DeviceInfo>)>,
     /// Where the box's OK button was drawn last (`App::error_ok_rect`).
     pub(crate) error_ok: Option<Rect>,
     /// The errors of the action running, shown as one box when it ends (`App::action`).
@@ -222,6 +239,13 @@ impl App {
             notified: Default::default(),
             audio_health: None,
             audio_reported: false,
+            audio_retries: 0,
+            audio_spec: None,
+            audio_retry_at: None,
+            audio_pending_retry: None,
+            audio_stream: None,
+            audio_spare: None,
+            audio_devices: None,
             error_ok: None,
             batch: None,
             error_close: None,
@@ -419,6 +443,169 @@ mod frame_stats_tests {
             lines[0],
             "frame stats: 30.5 frames/s, 2.00 ms CPU per frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod audio_retry_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn app_with_audio() -> App {
+        let (_, audio) = Link::new(Arc::new(orb_engine::tables::Tables::new()), None);
+        let mut app = App::new(Panel::new(), None);
+        app.audio_spare = Some(audio);
+        app.audio_health = Some(orb_player::output::Health::started());
+        app.audio_spec = Some("selected-by-environment".into());
+        app.settings.audio_device = Some("saved-device".into());
+        app
+    }
+
+    #[test]
+    fn failed_reopens_are_delayed_and_report_only_the_third_error_once() {
+        let mut app = app_with_audio();
+        let now = Instant::now();
+        app.check_audio_at(now, Some("old stream failure".into()), |_| {
+            panic!("must wait before reopening")
+        });
+        for attempt in 1..=3 {
+            let due = now + AUDIO_RETRY_DELAY * attempt;
+            app.check_audio_at(due - Duration::from_millis(1), None, |_| {
+                panic!("retry is not due yet")
+            });
+            let mut calls = 0;
+            app.check_audio_at(due, None, |app| {
+                calls += 1;
+                assert_eq!(app.audio_spec.as_deref(), Some("selected-by-environment"));
+                app.audio_health = None;
+                Err(format!("start failure {attempt}"))
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(app.audio_retries, attempt);
+            if attempt < 3 {
+                assert!(app.errors.is_empty());
+                assert!(!app.audio_reported);
+                assert_eq!(app.audio_pending_retry, Some(due + AUDIO_RETRY_DELAY));
+            }
+        }
+        assert_eq!(
+            app.errors.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["Audio output: start failure 3"]
+        );
+        assert!(app.audio_reported);
+        assert!(app.audio_pending_retry.is_none());
+        app.errors.clear();
+        app.check_audio_at(now + Duration::from_secs(60), None, |_| {
+            panic!("exhausted retries must stay exhausted")
+        });
+        assert!(app.errors.is_empty());
+    }
+
+    #[test]
+    fn a_successful_second_reopen_cancels_the_pending_retry() {
+        let mut app = app_with_audio();
+        let now = Instant::now();
+        app.check_audio_at(now, Some("lost device".into()), |_| unreachable!());
+        app.check_audio_at(now + AUDIO_RETRY_DELAY, None, |app| {
+            app.audio_health = None;
+            Err("device is still busy".into())
+        });
+        app.check_audio_at(now + AUDIO_RETRY_DELAY * 2, None, |app| {
+            app.audio_health = Some(orb_player::output::Health::started());
+            Ok(())
+        });
+        assert!(app.audio_pending_retry.is_none());
+        assert!(!app.audio_reported);
+        assert!(app.errors.is_empty());
+        app.check_audio_at(now + Duration::from_secs(2), None, |_| {
+            panic!("a healthy stream must not be reopened")
+        });
+        assert_eq!(app.audio_retries, 2);
+    }
+
+    #[test]
+    fn only_a_recovered_stream_resets_the_retry_budget_after_thirty_seconds() {
+        let mut app = app_with_audio();
+        let now = Instant::now();
+        app.audio_retries = 2;
+        app.audio_retry_at = Some(now);
+        app.check_audio_at(
+            now + Duration::from_secs(29),
+            Some("lost again".into()),
+            |_| unreachable!(),
+        );
+        // A delayed UI frame during a failed recovery must not reset the attempt count.
+        app.check_audio_at(now + Duration::from_secs(31), None, |_| {
+            Err("still unavailable".into())
+        });
+        assert_eq!(app.audio_retries, 3);
+        assert_eq!(app.errors.len(), 1);
+
+        let mut app = app_with_audio();
+        app.audio_retries = 3;
+        app.audio_retry_at = Some(now);
+        app.check_audio_at(
+            now + Duration::from_secs(30),
+            Some("new failure after recovery".into()),
+            |_| unreachable!(),
+        );
+        assert_eq!(app.audio_retries, 0);
+        assert!(app.audio_pending_retry.is_some());
+        assert!(app.errors.is_empty());
+    }
+
+    #[test]
+    fn losing_the_audio_during_reopen_reports_once_without_useless_retries() {
+        let mut app = app_with_audio();
+        let now = Instant::now();
+        app.check_audio_at(now, Some("lost device".into()), |_| unreachable!());
+        app.check_audio_at(now + AUDIO_RETRY_DELAY, None, |app| {
+            app.audio_health = None;
+            app.audio_spare = None;
+            Err("restart required".into())
+        });
+        assert_eq!(app.audio_retries, 1);
+        assert!(app.audio_reported);
+        assert!(app.audio_pending_retry.is_none());
+        assert_eq!(app.errors.len(), 1);
+        assert_eq!(app.errors[0], "Audio output: restart required");
+    }
+
+    #[test]
+    fn a_manual_switch_cancels_the_old_retry_and_its_budget() {
+        let mut app = App::new(Panel::new(), None);
+        app.audio_pending_retry = Some(Instant::now());
+        app.audio_retry_at = Some(Instant::now());
+        app.audio_retries = 2;
+        // No player in this demo app, so the switch needs no actual output device.
+        app.switch_audio(None);
+        assert!(app.audio_pending_retry.is_none());
+        assert!(app.audio_retry_at.is_none());
+        assert_eq!(app.audio_retries, 0);
+        assert!(!app.audio_reported);
+        assert!(app.errors.is_empty());
+    }
+
+    #[test]
+    fn an_idle_window_schedules_a_frame_for_the_pending_retry_without_a_stream() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let mut app = App::new(Panel::new(), None);
+        app.audio_pending_retry = Some(Instant::now() + Duration::from_secs(60));
+        let mut delay = Duration::MAX;
+        for frame in 0..6 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(PANEL_W, PANEL_H))),
+                time: Some(frame as f64),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.show(ui));
+            output.textures_delta.clear();
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        assert!(delay > Duration::from_secs(30), "{delay:?}");
+        assert!(delay <= Duration::from_secs(60), "{delay:?}");
+        assert!(app.audio_health.is_none());
     }
 }
 
@@ -781,23 +968,120 @@ fn paint_part_with(ui: &Ui, name: &str, rect: Rect, rot: Option<(f32, Vec2)>, ti
 }
 
 impl App {
+    /// Plays on `device` (`None`: the system default) from now on: the running stream is
+    /// stopped, which frees its device, and the same audio goes on a new one. On an error
+    /// there is no sound until a device that works is chosen.
+    pub(crate) fn switch_audio(&mut self, device: Option<&str>) {
+        self.audio_pending_retry = None;
+        self.audio_retry_at = None;
+        self.audio_retries = 0;
+        self.audio_reported = false;
+        if let Err(why) = self.try_switch_audio(device) {
+            self.audio_reported = true;
+            self.fail(format!("Audio output: {why}"));
+        }
+    }
+
+    fn try_switch_audio(&mut self, device: Option<&str>) -> Result<(), String> {
+        let audio = match self.audio_stream.take() {
+            Some(s) => {
+                let a = s.stop();
+                if a.is_none() {
+                    self.audio_health = None;
+                    return Err("restart OpenRB-338 to use the new device".into());
+                }
+                a
+            }
+            None => self.audio_spare.take(),
+        };
+        // no audio at all: the demo, which has no player
+        let Some(audio) = audio else { return Ok(()) };
+        self.audio_health = None;
+        match orb_player::output::start_keep(audio, device) {
+            Ok(s) => {
+                self.audio_health = Some(s.health());
+                self.audio_reported = false;
+                self.audio_stream = Some(s);
+                Ok(())
+            }
+            Err((e, audio)) => {
+                self.audio_spare = audio;
+                Err(e.to_string())
+            }
+        }
+    }
+
     /// Reports once, in the message box, that the sound has stopped for good (the rule of
     /// `orb_player::output::Health`); a transient stream error that the sound survives is only
     /// logged by the stream. It runs on every frame, so a device lost while the UI is idle is
     /// reported on the next frame it repaints.
     fn check_audio(&mut self) {
+        let failure = self.audio_health.as_ref().and_then(|h| h.failure());
+        self.check_audio_at(std::time::Instant::now(), failure, |app| {
+            let device = app.audio_spec.clone();
+            app.try_switch_audio(device.as_deref())
+        });
+    }
+
+    fn check_audio_at(
+        &mut self,
+        now: std::time::Instant,
+        failure: Option<String>,
+        mut reopen: impl FnMut(&mut Self) -> Result<(), String>,
+    ) {
         if self.audio_reported {
             return;
         }
-        if let Some(why) = self.audio_health.as_ref().and_then(|h| h.failure()) {
-            self.audio_reported = true;
-            self.fail(format!("Audio output: {why}"));
+        if self.audio_pending_retry.is_none() {
+            let Some(why) = failure else {
+                return;
+            };
+            // a stream that ran for 30 s after the last retry was a success: count afresh
+            if self
+                .audio_retry_at
+                .is_some_and(|t| now.duration_since(t) >= Duration::from_secs(30))
+            {
+                self.audio_retries = 0;
+            }
+            // Windows may take the device away for a moment (it is invalidated when the format
+            // changes or another program takes it): open it again a few times before giving up.
+            if self.audio_retries >= 3
+                || (self.audio_stream.is_none() && self.audio_spare.is_none())
+            {
+                self.audio_reported = true;
+                self.fail(format!("Audio output: {why}"));
+                return;
+            }
+            self.audio_pending_retry = Some(now + AUDIO_RETRY_DELAY);
+        }
+        let Some(due) = self.audio_pending_retry else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.audio_pending_retry = None;
+        self.audio_retries += 1;
+        self.audio_retry_at = Some(now);
+        if let Err(why) = reopen(self) {
+            if self.audio_retries >= 3
+                || (self.audio_stream.is_none() && self.audio_spare.is_none())
+            {
+                self.audio_reported = true;
+                self.fail(format!("Audio output: {why}"));
+            } else {
+                self.audio_pending_retry = Some(now + AUDIO_RETRY_DELAY);
+            }
         }
     }
 
     /// Draws the whole panel in the free area of `ui` and handles the input.
     pub fn show(&mut self, ui: &mut Ui) {
         self.check_audio();
+        if let Some(due) = self.audio_pending_retry {
+            ui.ctx()
+                .request_repaint_after(due.saturating_duration_since(std::time::Instant::now()));
+        }
         // The theme is always dark (task-127): the colors of the windows assume it. Set on
         // every frame, so a system theme that changes at run time cannot switch it back.
         if ui.ctx().options(|o| o.theme_preference) != egui::ThemePreference::Dark {
